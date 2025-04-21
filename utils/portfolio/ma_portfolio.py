@@ -1,37 +1,41 @@
+from typing import Any, Dict, Optional, Union
+
 import pandas as pd
-from typing import Dict, Optional, Union, Any, List
-from typeguard import typechecked
 from dateutil.relativedelta import relativedelta
+from typeguard import typechecked
 
 from utils.math import normalize
 from utils.portfolio.asset import Asset
-from utils.portfolio.tax_model import TaxModel
 
 from .null_tax_model import NullTaxModel
 
 
-class MAPortfolio():
+class MAPortfolio:
     @typechecked()
     def __init__(
-            self,
-            setup: Dict[str, Dict[str, Union[str, float]]],
-            start_value: float = 10000,
-            rebalancing: Optional[relativedelta] = None,
-            rebalancing_offset: Optional[relativedelta] = None,
-            detailed_output: bool = False,
-            details_memory: Optional[Dict[str, Any]] = None,
-            spread = 0,
-            tax_model = NullTaxModel(),
+        self,
+        setup: Dict[str, Dict[str, Union[str, float]]],
+        start_value: float = 10000,
+        rebalancing: Optional[relativedelta] = None,
+        rebalancing_offset: Optional[relativedelta] = None,
+        detailed_output: bool = False,
+        details_memory: Optional[Dict[str, Any]] = None,
+        spread=0,
+        tax_model=NullTaxModel(),
     ):
         assert len(setup.keys()) >= 1, "You must specify at least one ETF."
-        assert len(setup.keys()) == len(set(setup.keys())), "Every ETF must be unique in your portfilio."
+        assert len(setup.keys()) == len(set(setup.keys())), (
+            "Every ETF must be unique in your portfilio."
+        )
         for name, v in setup.items():
-            assert 'dist' in v, "Every asset needs a key 'dist'!"
-            if 'ma' not in v or v['ma'] == 1:
-                v['ma'] = 1
-                v['ma_asset'] = name
-            assert 'ma_asset' in v, "Every asset needs a key 'ma_asset'!"
-        assert sum([v['dist'] for v in setup.values()]) <= 100, f"Your Portfolio has an allocation of {sum([d for d in distribution.values()])}%"
+            assert "dist" in v, "Every asset needs a key 'dist'!"
+            if "ma" not in v or v["ma"] == 1:
+                v["ma"] = 1
+                v["ma_asset"] = name
+            assert "ma_asset" in v, "Every asset needs a key 'ma_asset'!"
+        assert sum([v["dist"] for v in setup.values()]) <= 100, (
+            f"Your Portfolio has an allocation of {sum([d for d in distribution.values()])}%"
+        )
 
         self._setup = setup
         self._start_value = start_value
@@ -42,95 +46,145 @@ class MAPortfolio():
         self._spread = spread / 2
         self._tax_model = tax_model
 
-
     def backtest(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Run a moving-average-based backtest on the portfolio setup.
+
+        Returns:
+            pd.DataFrame: Daily portfolio value breakdown by asset and total sum.
+        """
+
+        # ---- Initialization ----
+
         asset_names = list(self._setup.keys())
-        assets = {}
-        print(f"Backtest of portfolio with assets: {[str(s['dist'])+'% '+str(n) for n, s in self._setup.items()]}")
+        assets = {}  # Holds Asset objects for each ETF
+        self._values = {}  # Tracks cash held (if not invested) per asset
+        self._details_memory["asset"] = {
+            name: dict(buys=[], sells=[]) for name in asset_names
+        }
 
-        mas = pd.DataFrame(columns=asset_names)
-        self._values = {}
+        # Precompute moving averages for each asset (may reference other assets!)
+        mas = {
+            name: data[self._setup[name]["ma_asset"]]
+            .rolling(window=self._setup[name]["ma"])
+            .mean()
+            for name in asset_names
+        }
 
-        max_ma_length = max([v['ma'] for v in self._setup.values()])
+        # Find longest lookback for MAs, so we start only once all indicators are ready
+        max_ma_length = max(v["ma"] for v in self._setup.values())
 
-        self._details_memory['asset'] = {}
-        for name, setup in self._setup.items():
-            assert name in data.columns, f"Asset with the name {name} does not exist in data ({data.columns})."
-            self._details_memory['asset'][name] = dict(buys=[], sells=[])
+        # Set initial cash allocation and instantiate asset objects for each ETF
+        for name in asset_names:
+            assert name in data.columns, (
+                f"Asset with the name {name} does not exist in data ({data.columns})."
+            )
+            # Initialize with cash allocated per distribution
+            self._values[name] = (self._start_value * self._setup[name]["dist"]) / 100
+            assets[name] = Asset(name, detailed_output=False)
 
-            value_to_buy = (self._start_value * setup['dist'])/100
-            self._values[name] = value_to_buy
-            assets[name] = Asset(name, detailed_output = False)
-            mas[name] = data[self._setup[name]['ma_asset']].rolling(window=setup['ma']).mean()
+        # Prepare results DataFrame with valid range (after max_ma_length)
+        portfolio_values = pd.DataFrame(
+            index=data.index[max_ma_length:], columns=asset_names + ["sum"]
+        )
 
-        portfolio_values = pd.DataFrame(columns=asset_names+['sum'], index=mas.index[max_ma_length:])
-
+        # Schedule next rebalancing event, if used
         if self._rebalancing is not None:
-            next_rebalancing = min(portfolio_values.index) + self._rebalancing + self._rebalancing_offset
+            next_rebalancing = (
+                portfolio_values.index[0] + self._rebalancing + self._rebalancing_offset
+            )
+
+        # ---- Simulation Loop ----
 
         for i in portfolio_values.index:
-            if (self._rebalancing is not None) and (i > next_rebalancing):
+            # a) Rebalancing if due
+            if self._rebalancing is not None and i > next_rebalancing:
                 next_rebalancing = next_rebalancing + self._rebalancing
                 self._do_rebalancing(assets, data.loc[i, :])
 
+            # b) Process each asset according to MA signal logic
             for name in asset_names:
+                setup = self._setup[name]
                 asset_price = data.loc[i, name]
-                compare_asset_price = data.loc[i, self._setup[name]['ma_asset']]
-                if (compare_asset_price >= mas.loc[i, name]):
-                    if self._values[name] is not None:
-                        real_asset_price = asset_price * (1 + self._spread)
-                        self._log(f"** {i}: [{self._setup[name]['ma_asset']}] Base-Value (${compare_asset_price:.2f}) >= MA (${mas.loc[i, name]:.2f})")
+                ma_value = mas[name].loc[i]
+                compare_price = data.loc[i, setup["ma_asset"]]
 
-                        amount = self._values[name]/real_asset_price
-                        self._log(f" => Buy {amount:.2f}x {name} for ${real_asset_price:.2f} each (total: ${self._values[name]:.2f})")
+                # --- Entry logic: buy if trend is up and not already invested
+                if compare_price >= ma_value and self._values[name] is not None:
+                    real_price = asset_price * (1 + self._spread)
+                    amount = self._values[name] / real_price
+                    self._log(
+                        f"[{i}] Buy {amount:.2f}x {name} at ${real_price:.2f} (Trend Up, MA={ma_value:.2f})"
+                    )
+                    assets[name].buy(amount, real_price)
+                    self._details_memory["asset"][name]["buys"].append(i)
+                    self._values[name] = None
 
-                        self._details_memory['asset'][name]['buys'].append(i)
-                        assets[name].buy(amount, real_asset_price)
-                        self._values[name] = None
+                # --- Exit logic: sell if trend is down and currently invested
+                elif compare_price < ma_value and self._values[name] is None:
+                    real_price = asset_price * (1 - self._spread)
+                    amount = assets[name].amount
+                    proceeds = amount * real_price
+                    self._log(
+                        f"[{i}] Sell {amount:.2f}x {name} at ${real_price:.2f} (Trend Down, MA={ma_value:.2f})"
+                    )
+                    _, gain = assets[name].sell(amount, real_price)
+                    self._details_memory["asset"][name]["sells"].append(i)
+                    self._tax_model.add_gain(name, gain)
+                    # Store cash from sale for this asset
+                    self._values[name] = proceeds
 
-                elif (compare_asset_price < mas.loc[i, name]):
-                    if self._values[name] is None:
-                        real_asset_price = asset_price * (1 - self._spread)
-                        self._log(f"** {i}: [{self._setup[name]['ma_asset']}] Base-Value (${compare_asset_price:.2f}) < MA (${mas.loc[i, name]:.2f})")
-                        self._log(f" => Sell {assets[name].amount:.2f}x {name} for ${real_asset_price:.2f} each (total: ${assets[name].amount * real_asset_price:.2f})")
+                # --- Record value: holding + any uninvested cash
+                value_held = assets[name].amount * asset_price
+                cash = self._get_value(name)
+                portfolio_values.loc[i, name] = value_held + cash
 
-                        self._values[name] = assets[name].amount * real_asset_price
-                        _, gain = assets[name].sell(assets[name].amount, real_asset_price)
-                        self._tax_model.add_gain(name, gain)
-                        self._details_memory['asset'][name]['sells'].append(i)
-
-                portfolio_values.loc[i, name] = assets[name].amount * asset_price + self._get_value(name)
-
+            # c) Pay any tax due (auto-liquidates assets/cash if needed)
             while self._tax_model.open_tax > 1.0:
                 self._sell(assets, data.loc[i, :], self._tax_model.open_tax)
 
-        portfolio_values['sum']= portfolio_values.apply(lambda r: r.sum(), axis=1)
+        # ---- Finalization ----
 
-        self._details_memory['chart'] = {}
-        for name, _ in self._setup.items():
-            n = data[name]
-            self._details_memory['chart'][name+'_ma'] = mas[name]
-            self._details_memory['chart'][name+'_ma_asset'] = data[self._setup[name]['ma_asset']]
-            self._details_memory['chart'][name] = n
-            self._details_memory['chart'][name+'_value'] = normalize(portfolio_values[name], n)
+        # Total portfolio value per day
+        portfolio_values["sum"] = portfolio_values[asset_names].sum(axis=1)
+
+        # Store chart data for visualization
+        self._details_memory["chart"] = {}
+        for name in asset_names:
+            self._details_memory["chart"][f"{name}_ma"] = mas[name]
+            self._details_memory["chart"][f"{name}_ma_asset"] = data[
+                self._setup[name]["ma_asset"]
+            ]
+            self._details_memory["chart"][name] = data[name]
+            self._details_memory["chart"][f"{name}_value"] = normalize(
+                portfolio_values[name], data[name]
+            )
 
         return portfolio_values
 
-
     def _sell(self, assets, prices, target: float):
         self._log(f" * Sell assets to get ${target:.2f} for tax.")
-        sum_value = sum([(prices[name] * asset.amount + self._get_value(name)) for name, asset in assets.items()])
+        sum_value = sum(
+            [
+                (prices[name] * asset.amount + self._get_value(name))
+                for name, asset in assets.items()
+            ]
+        )
         for name, asset in assets.items():
             value = asset.amount * prices[name] + self._get_value(name)
             percent = (value / sum_value) * 100
             asset_target = (target * percent) / 100
             if asset_target < 0.1:
-                self._log(f"Ignore selling [{name}] since amount ${asset_target:.2f} is too small.")
+                self._log(
+                    f"Ignore selling [{name}] since amount ${asset_target:.2f} is too small."
+                )
                 continue
 
             if self._values[name] is None:
-                amount = asset_target/prices[name]
-                self._log(f"Sell {amount} (from {assets[name].amount}) of [{name}] to pay ${asset_target:.2f} of tax.")
+                amount = asset_target / prices[name]
+                self._log(
+                    f"Sell {amount} (from {assets[name].amount}) of [{name}] to pay ${asset_target:.2f} of tax."
+                )
                 _, gain = asset.sell(amount, prices[name])
                 self._tax_model.pay_tax(name, asset_target)
                 self._tax_model.add_gain(name, gain)
@@ -140,25 +194,33 @@ class MAPortfolio():
                 self._values[name] -= asset_target
                 self._tax_model.pay_tax(name, asset_target)
 
-
     def _do_rebalancing(self, assets: Dict[str, Asset], prices: pd.Series):
         self._log(f"** Rebalancing: {prices.name}")
 
-        sum_value = sum([(prices[name] * asset.amount) + self._get_value(name) for name, asset in assets.items()])
+        sum_value = sum(
+            [
+                (prices[name] * asset.amount) + self._get_value(name)
+                for name, asset in assets.items()
+            ]
+        )
         for name, asset in assets.items():
             value = asset.amount * prices[name] + self._get_value(name)
             percent = (value / sum_value) * 100
-            diff = percent - self._setup[name]['dist']
-            self._log(f" * current state [{name}]: ${value:.2f} (percent: {percent:.2f}%, diff: {diff:.2f}%)")
+            diff = percent - self._setup[name]["dist"]
+            self._log(
+                f" * current state [{name}]: ${value:.2f} (percent: {percent:.2f}%, diff: {diff:.2f}%)"
+            )
 
-            target_value = (self._setup[name]['dist'] * sum_value)/100
+            target_value = (self._setup[name]["dist"] * sum_value) / 100
             diff_value = value - target_value
 
             if diff_value > 0:
                 if self._values[name] is None:
                     asset_price = prices[name] * (1 - self._spread)
-                    amount = diff_value/asset_price
-                    self._log(f" => Sell {amount:.2f}x {name} for ${asset_price:.2f} each (total: ${amount * asset_price:.2f})")
+                    amount = diff_value / asset_price
+                    self._log(
+                        f" => Sell {amount:.2f}x {name} for ${asset_price:.2f} each (total: ${amount * asset_price:.2f})"
+                    )
                     _, gain = asset.sell(amount, asset_price)
                     self._tax_model.add_gain(name, gain)
 
@@ -169,8 +231,10 @@ class MAPortfolio():
             elif diff_value < 0:
                 if self._values[name] is None:
                     asset_price = prices[name] * (1 + self._spread)
-                    amount = -diff_value/asset_price
-                    self._log(f" => Buy {amount:.2f}x {name} for ${asset_price:.2f} each (total: ${amount * asset_price:.2f})")
+                    amount = -diff_value / asset_price
+                    self._log(
+                        f" => Buy {amount:.2f}x {name} for ${asset_price:.2f} each (total: ${amount * asset_price:.2f})"
+                    )
                     asset.buy(amount, asset_price)
 
                 else:
@@ -179,15 +243,15 @@ class MAPortfolio():
 
             value = asset.amount * prices[name] + self._get_value(name)
             percent = (value / sum_value) * 100
-            diff = percent - self._setup[name]['dist']
+            diff = percent - self._setup[name]["dist"]
             if self._detailed_output:
-                self._log(f"  ==> {name}: ${value:.2f} (percent: {percent:.2f}%, diff: {diff:.2f}%)")
-
+                self._log(
+                    f"  ==> {name}: ${value:.2f} (percent: {percent:.2f}%, diff: {diff:.2f}%)"
+                )
 
     def _log(self, msg):
         if self._detailed_output:
             print(msg)
-
 
     def _get_value(self, name):
         return self._values[name] if self._values[name] is not None else 0

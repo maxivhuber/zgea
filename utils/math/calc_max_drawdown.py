@@ -1,11 +1,14 @@
-import pandas as pd
-import numpy as np
-from typeguard import typechecked
 from typing import Tuple
+
+import numpy as np
+import pandas as pd
+from typeguard import typechecked
 
 
 @typechecked()
-def calc_max_drawdown(data: pd.DataFrame, progress_output: bool = False) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def calc_max_drawdown(
+    data: pd.DataFrame, progress_output: bool = False
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """
     Calculates the maximum drawdown of all assets in the dataframe.
 
@@ -16,20 +19,22 @@ def calc_max_drawdown(data: pd.DataFrame, progress_output: bool = False) -> Tupl
 
     max_drawdown = pd.Series(index=data.columns, dtype=np.float64)
     max_value = pd.Series(index=data.columns, dtype=np.float64)
-    max_drawdown_start = pd.Series(index=data.columns, dtype=np.float64)
-    max_drawdown_last_max_value = pd.Series(index=data.columns, dtype=np.float64)
-    max_drawdown_end = pd.Series(index=data.columns, dtype=np.float64)
+
+    # Fixed dtypes for date values
+    max_drawdown_start = pd.Series(index=data.columns, dtype="datetime64[ns]")
+    max_drawdown_last_max_value = pd.Series(index=data.columns, dtype="datetime64[ns]")
+    max_drawdown_end = pd.Series(index=data.columns, dtype="datetime64[ns]")
     last_year = 0
 
     for i in data.index:
         for a in data.columns:
-            if np.isnan(max_value[a]) or data.loc[i, a] > max_value[a]:
+            if pd.isna(max_value[a]) or data.loc[i, a] > max_value[a]:
                 max_value[a] = data.loc[i, a]
                 max_drawdown_last_max_value[a] = i
 
             drawdown = (data.loc[i, a] / max_value[a] - 1) * 100
 
-            if np.isnan(max_drawdown[a]) or drawdown < max_drawdown[a]:
+            if pd.isna(max_drawdown[a]) or drawdown < max_drawdown[a]:
                 max_drawdown[a] = drawdown
                 max_drawdown_end[a] = i
                 max_drawdown_start[a] = max_drawdown_last_max_value[a]
