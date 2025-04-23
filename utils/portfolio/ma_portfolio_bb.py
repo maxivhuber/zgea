@@ -49,16 +49,6 @@ class MABollingerPortfolio:
         self._tax_model = tax_model
 
     def backtest(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Run a MA+Bollinger backtest:
-        1. When price falls below its moving average, set a 'wait for BB' flag.
-        2. If, while below the MA, price falls BELOW the lower Bollinger, SELL.
-        3. If price rises back above the MA before selling, reset the flag.
-        4. Buying: When price is above MA (original logic).
-        Returns:
-            pd.DataFrame: Daily portfolio value breakdown by asset and total sum.
-        """
-
         asset_names = list(self._setup.keys())
         assets = {}
         self._values = {}
@@ -100,8 +90,9 @@ class MABollingerPortfolio:
             index=data.index[max_ma_length:], columns=asset_names + ["sum"]
         )
 
-        # Prepare MA wait state variables
-        ma_below_flag = {name: False for name in asset_names}
+        # Prepare MA wait state variables for buy and sell
+        ma_below_flag = {name: False for name in asset_names}  # waiting to sell
+        ma_above_flag = {name: False for name in asset_names}  # waiting to buy
 
         # Prepare next rebalancing event, if used
         if self._rebalancing is not None:
@@ -121,46 +112,52 @@ class MABollingerPortfolio:
                 asset_price = data.loc[i, name]
                 ma_value = mas[name].loc[i]
                 compare_price = data.loc[i, setup["ma_asset"]]
+                upper_band = boll_bands[name]["upper"].loc[i]
                 lower_band = boll_bands[name]["lower"].loc[i]
 
-                # ---- 1) Reset wait flag and BUY if price above MA
-                if compare_price >= ma_value:
-                    # BUY logic if not currently invested
-                    if self._values[name] is not None:
-                        # print(f"buy: {i}")
+                #### --- BUY LOGIC: track crossing above MA, then buy if above BB upper ---
+                if self._values[name] is not None:  # Not invested, waiting for buy
+                    # If we rise above MA (trigger the buy wait flag)
+                    if compare_price > ma_value and not ma_above_flag[name]:
+                        ma_above_flag[name] = True
+                    # If we fall below MA before buying: reset the flag
+                    elif compare_price <= ma_value:
+                        ma_above_flag[name] = False
+
+                    # If we're above MA, in wait mode, and now price breaks out above upper BB: BUY
+                    if ma_above_flag[name] and compare_price > upper_band:
                         real_price = asset_price * (1 + self._spread)
                         amount = self._values[name] / real_price
                         self._log(
-                            f"[{i}] Buy {amount:.2f}x {name} at ${real_price:.2f} (Uptrend, MA={ma_value:.2f})"
+                            f"[{i}] Buy {amount:.2f}x {name} at ${real_price:.2f} (Above MA, upper BB breach)"
                         )
                         assets[name].buy(amount, real_price)
                         self._details_memory["asset"][name]["buys"].append(i)
                         self._values[name] = None
-                    # Always reset wait flag if price above MA
-                    ma_below_flag[name] = False
+                        ma_above_flag[name] = False  # reset after buy
 
-                # ---- 2) Set wait flag if crosses below MA (only once)
-                elif compare_price < ma_value and ma_below_flag[name] is False:
-                    ma_below_flag[name] = True  # price crossed below MA
+                #### --- SELL LOGIC: track crossing below MA, then sell if below BB lower ---
+                if self._values[name] is None:  # Invested, waiting for sell
+                    # If we fall below MA, trigger the sell wait flag
+                    if compare_price < ma_value and not ma_below_flag[name]:
+                        ma_below_flag[name] = True
+                    # If we rise above MA before selling: reset the flag
+                    elif compare_price >= ma_value:
+                        ma_below_flag[name] = False
 
-                # ---- 3) SELL if in wait-state, invested, and falls below lower BB band
-                if (
-                    ma_below_flag[name]
-                    and self._values[name] is None  # invested
-                    and compare_price < lower_band
-                ):
-                    # print(f"sell: {i}")
-                    real_price = asset_price * (1 - self._spread)
-                    amount = assets[name].amount
-                    proceeds = amount * real_price
-                    self._log(
-                        f"[{i}] Sell {amount:.2f}x {name} at ${real_price:.2f} (Below MA, lower BB breach)"
-                    )
-                    _, gain = assets[name].sell(amount, real_price)
-                    self._details_memory["asset"][name]["sells"].append(i)
-                    self._tax_model.add_gain(name, gain)
-                    self._values[name] = proceeds
-                    ma_below_flag[name] = False  # reset after selling
+                    # If we're below MA, in wait mode, and price falls below lower BB: SELL
+                    if ma_below_flag[name] and compare_price < lower_band:
+                        real_price = asset_price * (1 - self._spread)
+                        amount = assets[name].amount
+                        proceeds = amount * real_price
+                        self._log(
+                            f"[{i}] Sell {amount:.2f}x {name} at ${real_price:.2f} (Below MA, lower BB breach)"
+                        )
+                        _, gain = assets[name].sell(amount, real_price)
+                        self._details_memory["asset"][name]["sells"].append(i)
+                        self._tax_model.add_gain(name, gain)
+                        self._values[name] = proceeds
+                        ma_below_flag[name] = False  # reset after selling
 
                 # ---- 4) Record value
                 value_held = assets[name].amount * asset_price
